@@ -665,20 +665,31 @@ impl<T: Storage> RawNode<T> {
     ///
     /// Since Ready must be persisted in order, calling this function implicitly means
     /// all ready collected before have been persisted.
+    /// 在未应用已提交日志的情况下驱动 ready .
+    /// 之后需要使用 Self::advance_apply 或 Self::advance_apply_to 来更新 applying 进程
+    /// LightReady 包含了可以被应用的日志，已提交编号和msg 消息
+    /// 由于 Ready 结构体必须按照顺序被持久化，“暗中”调用本方法意味着之前收集的所有ready 已经被持久化
     #[inline]
     pub fn advance_append(&mut self, rd: Ready) -> LightReady {
+        // commit_ready(rd) 先将 unstable 的entries 和snapshot 清空，
+        // 并用 ready 中的 hard/soft state 作为 prev hs/ss 值
         self.commit_ready(rd);
-        self.on_persist_ready(self.max_number);
+        // gen_light_ready() 得到一个没有 commit index 的 LightReady，
+        // 其中 committed entries 是raft log 中 commit_since_index 位置之后的日志，
+        // 这里再次根据 raftlog 获得了已提交待应用的日志，
+        // 而没有直接使用ready 中包含的 entries，为什么？TODO(zhangpc)
         let mut light_rd = self.gen_light_ready();
         if self.raft.state != StateRole::Leader && !light_rd.messages().is_empty() {
             fatal!(self.raft.logger, "not leader but has new msg after advance");
         }
         // Set commit index if it's updated
-        let hard_state = self.raft.hard_state();
-        if hard_state.commit > self.prev_hs.commit {
-            light_rd.commit_index = Some(hard_state.commit);
+        // 若raft 当前实际的 committend index 有更新，说明在ready 在 raft 层 -> app 层 -> raft 层 流转的过程中，有新的日志完成了提交
+        // 可以在返回 light ready 时告知 app 层，使其更新已提交的日志编号，方便后续应用
+        let hard_state = self.raft.hard_state();// 获取 raft 当前 hs，其中 commit 是获取 raftLog 当前实际的 committed index
+        if hard_state.commit > self.prev_hs.commit {// raftlog 当前的 committed index 大于 ready 中hs 记录的 committed index
+            light_rd.commit_index = Some(hard_state.commit);// 若 raftlog 实际的 committed index 有变化，将最新hs 的commit index 赋给 light ready
             self.prev_hs.commit = hard_state.commit;
-        } else {
+        } else {// raftlog 当前的 committed index 小于等于 ready 中hs 记录的 committed index
             assert!(hard_state.commit == self.prev_hs.commit);
             light_rd.commit_index = None;
         }
